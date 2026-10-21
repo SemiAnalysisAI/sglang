@@ -9,6 +9,7 @@ use dynamo_protocols::types::{ChatCompletionRequestMessage, CreateChatCompletion
 use serde_json::Value;
 use sglang_processor::dynamo_renderer::deepseek::common::tokens;
 use sglang_processor::dynamo_renderer::{OAIChatLikeRequest, TextInput};
+use sglang_processor::dynamo_tokenizers::Tokenizer;
 
 pub use sglang_processor::ChatFormatter;
 use sglang_processor::TemplateError;
@@ -17,6 +18,65 @@ pub(super) use crate::message::request::RenderedChat;
 
 /// Extra variables for the chat template (`chat_template_kwargs`).
 pub type ChatTemplateKwargs = HashMap<String, serde_json::Value>;
+
+/// Encodes rendered chat prompts as Python's chat layer does.
+#[derive(Clone)]
+pub struct PromptEncoder {
+    tokenizer: Tokenizer,
+    /// Ids the tokenizer adds on its own (`encode("")`).
+    auto_specials: Vec<u32>,
+    bos: Option<u32>,
+}
+
+impl PromptEncoder {
+    pub fn new(tokenizer: Tokenizer, server_args: &crate::message::config::ServerArgs) -> Self {
+        use crate::tokenizer_manager::tokenizer::TextTokenizer;
+        let bos = crate::tokenizer_manager::tokenizer::DynamoTokenizer::new(
+            tokenizer.clone(),
+            &server_args.tokenizer_path,
+            server_args.revision.as_deref(),
+        )
+        .bos_token_id()
+        .and_then(|id| u32::try_from(id).ok());
+        let auto_specials = tokenizer
+            .encode("")
+            .map(|encoding| encoding.token_ids().to_vec())
+            .unwrap_or_default();
+        Self {
+            tokenizer,
+            auto_specials,
+            bos,
+        }
+    }
+
+    /// The template output without the tokenizer's own specials, its segments
+    /// keeping their special-token policy (Kimi K3), then the continuation
+    /// encoded on its own without its BOS.
+    pub(super) fn encode(&self, rendered: &RenderedChat) -> Result<Vec<u32>, String> {
+        let encode = |text: &str| match self.tokenizer.encode(text) {
+            Ok(encoding) => Ok(encoding.token_ids().to_vec()),
+            Err(error) => Err(error.to_string()),
+        };
+        let mut ids = match rendered.prompt.encode_segments() {
+            Some(segments) => self
+                .tokenizer
+                .encode_segments(&segments)
+                .map_err(|error| error.to_string())?
+                .token_ids()
+                .to_vec(),
+            None => encode(rendered.prompt.as_str())?,
+        };
+        if ids.starts_with(&self.auto_specials) {
+            ids.drain(..self.auto_specials.len());
+        }
+        if !rendered.continuation.is_empty() {
+            let suffix = encode(&rendered.continuation)?;
+            let skip = usize::from(self.bos.is_some() && suffix.first() == self.bos.as_ref());
+            ids.extend(&suffix[skip..]);
+        }
+        Ok(ids)
+    }
+}
 
 /// Render a chat request for the tokenizer pool.
 /// Formatters with an SGLang request path render the raw `body` and return the
@@ -29,39 +89,54 @@ pub(super) fn render_chat(
     kwargs: Option<&ChatTemplateKwargs>,
     defaults: &ChatTemplateKwargs,
 ) -> Result<RenderedChat, TemplateError> {
-    match formatter {
-        ChatFormatter::DeepSeekV4(_)
-        | ChatFormatter::DeepSeekV41
-        | ChatFormatter::Glm53(_)
-        | ChatFormatter::KimiK3
-        | ChatFormatter::Qwen38 { .. } => {
-            let (prompt, mut continuation) = formatter.render_request(body, defaults)?;
-            // SGLang tokenizes the DeepSeek-V4 prefix on its own and drops its leading BOS.
-            if matches!(
-                formatter,
-                ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41
-            ) && let Some(rest) = continuation.strip_prefix(tokens::BOS)
-            {
-                continuation = rest.to_owned();
-            }
-            Ok(RenderedChat {
-                prompt,
-                continuation,
-            })
-        }
-        _ => {
-            // Python's `_process_messages`: the defaults under the request's own.
-            let mut merged = defaults.clone();
-            merged.extend(kwargs.cloned().unwrap_or_default());
-            let kwargs = (!merged.is_empty()).then_some(&merged);
-            formatter
-                .render_prompt(&TemplateRequest { request, kwargs })
-                .map(|prompt| RenderedChat {
-                    prompt,
-                    continuation: String::new(),
-                })
-        }
+    if let Some(rendered) = render_body(formatter, body, defaults) {
+        return rendered;
     }
+    // Python's `_process_messages`: the defaults under the request's own.
+    let mut merged = defaults.clone();
+    merged.extend(kwargs.cloned().unwrap_or_default());
+    let kwargs = (!merged.is_empty()).then_some(&merged);
+    formatter
+        .render_prompt(&TemplateRequest { request, kwargs })
+        .map(|prompt| RenderedChat {
+            prompt,
+            continuation: String::new(),
+        })
+}
+
+/// Render the raw body as SGLang does, retaining the continuation boundary.
+pub(super) fn render_body(
+    formatter: &ChatFormatter,
+    body: Value,
+    defaults: &ChatTemplateKwargs,
+) -> Option<Result<RenderedChat, TemplateError>> {
+    if !matches!(
+        formatter,
+        ChatFormatter::DeepSeekV4(_)
+            | ChatFormatter::DeepSeekV41
+            | ChatFormatter::Glm53(_)
+            | ChatFormatter::KimiK3
+            | ChatFormatter::Qwen38 { .. }
+    ) {
+        return None;
+    }
+    Some(
+        formatter
+            .render_request(body, defaults)
+            .map(|(prompt, mut continuation)| {
+                if matches!(
+                    formatter,
+                    ChatFormatter::DeepSeekV4(_) | ChatFormatter::DeepSeekV41
+                ) && let Some(rest) = continuation.strip_prefix(tokens::BOS)
+                {
+                    continuation = rest.to_owned();
+                }
+                RenderedChat {
+                    prompt,
+                    continuation,
+                }
+            }),
+    )
 }
 
 /// The wire request plus its `chat_template_kwargs`, which the protocol type

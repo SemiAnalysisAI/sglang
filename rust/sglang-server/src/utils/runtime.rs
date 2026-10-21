@@ -354,6 +354,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                         cfg.rust_server_args.metrics_listener,
                         http_layer,
                         shutdown_rx.clone(),
+                        dyn_tokenizer.clone(),
                     );
                     if let Some((listener, service)) = grpc_server {
                         tokio::join!(
