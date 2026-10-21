@@ -321,7 +321,6 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         let cfg = cfg.clone();
         let api_cores = plan.as_ref().map(|p| p.api.clone());
         let shutdown_rx = shutdown_rx.clone();
-        let http_tokenizer = dyn_tokenizer.clone();
         let grpc_server = grpc_listener.map(|listener| {
             let service =
                 api_server::grpc::service::GrpcService::new(core.clone(), &cfg.server_args);
@@ -352,7 +351,6 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                         cfg.rust_server_args.metrics_listener,
                         http_layer,
                         shutdown_rx.clone(),
-                        http_tokenizer,
                     );
                     if let Some((listener, service)) = grpc_server {
                         tokio::join!(
